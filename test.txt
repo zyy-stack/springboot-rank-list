@@ -1,0 +1,204 @@
+from typing import List
+import cv2
+import numpy as np
+
+
+def projection_by_bboxes(boxes: np.array, axis: int) -> np.ndarray:
+    """
+     通过一组 bbox 获得投影直方图，最后以 per-pixel 形式输出
+
+    Args:
+        boxes: [N, 4]
+        axis: 0-x坐标向水平方向投影， 1-y坐标向垂直方向投影
+
+    Returns:
+        1D 投影直方图，长度为投影方向坐标的最大值(我们不需要图片的实际边长，因为只是要找文本框的间隔)
+
+    """
+    assert axis in [0, 1]
+    length = np.max(boxes[:, axis::2])
+    res = np.zeros(length, dtype=int)
+    # TODO: how to remove for loop?
+    for start, end in boxes[:, axis::2]:
+        res[start:end] += 1
+    return res
+
+
+def split_projection_profile_zero(arr_values: np.ndarray, min_gap: int = 1):
+    """
+    按投影直方图低谷（值为 0）切割
+    """
+    arr_index = np.where(arr_values > 0)[0]
+    if not len(arr_index):
+        return None
+
+    arr_diff = arr_index[1:] - arr_index[:-1]
+    arr_diff_index = np.where(arr_diff > min_gap)[0]
+
+    arr_zero_start = arr_index[arr_diff_index]  # 零区间前一个非零位置
+    arr_zero_end = arr_index[arr_diff_index + 1]  # 零区间后一个非零位置
+
+    # 切割区间
+    arr_start = np.insert(arr_zero_end, 0, arr_index[0])
+    arr_end = np.append(arr_zero_start, arr_index[-1])
+    arr_end += 1
+    return arr_start, arr_end
+
+
+def recursive_xy_cut_grouped(boxes: np.ndarray, indices: List[int], res_groups: List[List[int]]):
+    if len(boxes) == 0:
+        return
+
+    # y 方向投影
+    y_projection = projection_by_bboxes(boxes, axis=1)
+    pos_y = split_projection_profile_zero(y_projection, min_gap=1)
+
+    if pos_y:
+        arr_y0, arr_y1 = pos_y
+        for r0, r1 in zip(arr_y0, arr_y1):
+            y_mask = (boxes[:, 1] >= r0) & (boxes[:, 1] < r1)
+            boxes_chunk = boxes[y_mask]
+            indices_chunk = np.array(indices)[y_mask]
+
+            # x 方向投影
+            x_projection = projection_by_bboxes(boxes_chunk, axis=0)
+            pos_x = split_projection_profile_zero(x_projection, min_gap=1)
+
+            if pos_x and len(pos_x[0]) > 1:
+                # x 方向可切，继续递归
+                arr_x0, arr_x1 = pos_x
+                for c0, c1 in zip(arr_x0, arr_x1):
+                    x_mask = (boxes_chunk[:, 0] >= c0) & (boxes_chunk[:, 0] < c1)
+                    recursive_xy_cut_grouped(boxes_chunk[x_mask], indices_chunk[x_mask], res_groups)
+            else:
+                # x 方向无法切，也作为一组
+                res_groups.append(indices_chunk.tolist())
+    else:
+        # y 方向无法切，尝试 x 方向切割整个区域
+        x_projection = projection_by_bboxes(boxes, axis=0)
+        pos_x = split_projection_profile_zero(x_projection, min_gap=1)
+        if pos_x and len(pos_x[0]) > 1:
+            arr_x0, arr_x1 = pos_x
+            for c0, c1 in zip(arr_x0, arr_x1):
+                x_mask = (boxes[:, 0] >= c0) & (boxes[:, 0] < c1)
+                recursive_xy_cut_grouped(boxes[x_mask], np.array(indices)[x_mask], res_groups)
+        else:
+            # x 方向也无法切，最终作为一个组
+            res_groups.append(indices)
+
+
+def points_to_bbox(points):
+    assert len(points) == 8
+
+    # [x1,y1,x2,y2,x3,y3,x4,y4]
+    left = min(points[::2])
+    right = max(points[::2])
+    top = min(points[1::2])
+    bottom = max(points[1::2])
+
+    left = max(left, 0)
+    top = max(top, 0)
+    right = max(right, 0)
+    bottom = max(bottom, 0)
+    return [left, top, right, bottom]
+
+
+def bbox2points(bbox):
+    left, top, right, bottom = bbox
+    return [left, top, right, top, right, bottom, left, bottom]
+
+
+def vis_polygon(img, points, thickness=2, color=None):
+    br2bl_color = color
+    tl2tr_color = color
+    tr2br_color = color
+    bl2tl_color = color
+    cv2.line(
+        img,
+        (points[0][0], points[0][1]),
+        (points[1][0], points[1][1]),
+        color=tl2tr_color,
+        thickness=thickness,
+    )
+
+    cv2.line(
+        img,
+        (points[1][0], points[1][1]),
+        (points[2][0], points[2][1]),
+        color=tr2br_color,
+        thickness=thickness,
+    )
+
+    cv2.line(
+        img,
+        (points[2][0], points[2][1]),
+        (points[3][0], points[3][1]),
+        color=br2bl_color,
+        thickness=thickness,
+    )
+
+    cv2.line(
+        img,
+        (points[3][0], points[3][1]),
+        (points[0][0], points[0][1]),
+        color=bl2tl_color,
+        thickness=thickness,
+    )
+    return img
+
+
+def vis_points(
+    img: np.ndarray, points, texts: List[str] = None, color=(0, 200, 0)
+) -> np.ndarray:
+    """
+
+    Args:
+        img:
+        points: [N, 8]  8: x1,y1,x2,y2,x3,y3,x3,y4
+        texts:
+        color:
+
+    Returns:
+
+    """
+    points = np.array(points)
+    if texts is not None:
+        assert len(texts) == points.shape[0]
+
+    for i, _points in enumerate(points):
+        vis_polygon(img, _points.reshape(-1, 2), thickness=2, color=color)
+        bbox = points_to_bbox(_points)
+        left, top, right, bottom = bbox
+        cx = (left + right) // 2
+        cy = (top + bottom) // 2
+
+        txt = texts[i]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cat_size = cv2.getTextSize(txt, font, 0.5, 2)[0]
+
+        img = cv2.rectangle(
+            img,
+            (cx - 5 * len(txt), cy - cat_size[1] - 5),
+            (cx - 5 * len(txt) + cat_size[0], cy - 5),
+            color,
+            -1,
+        )
+
+        img = cv2.putText(
+            img,
+            txt,
+            (cx - 5 * len(txt), cy - 5),
+            font,
+            0.5,
+            (255, 255, 255),
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+
+    return img
+
+
+def vis_polygons_with_index(image, points):
+    texts = [str(i) for i in range(len(points))]
+    res_img = vis_points(image.copy(), points, texts)
+    return res_img
