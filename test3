@@ -1,0 +1,185 @@
+from typing import List, Optional
+import numpy as np
+
+# -----------------------------
+# 投影相关函数
+# -----------------------------
+def projection_by_bboxes(boxes: np.ndarray, axis: int) -> np.ndarray:
+    assert axis in [0, 1]
+    length = int(np.max(boxes[:, axis::2])) + 1
+    res = np.zeros(length, dtype=int)
+    for start, end in boxes[:, axis::2]:
+        res[start:end] += 1
+    return res
+
+def split_projection_profile_zero(arr_values: np.ndarray):
+    if arr_values is None or len(arr_values) == 0:
+        return None
+    arr_bool = arr_values > 0
+    segments = []
+    in_seg = False
+    start = 0
+    for i, v in enumerate(arr_bool):
+        if v and not in_seg:
+            in_seg = True
+            start = i
+        elif not v and in_seg:
+            in_seg = False
+            segments.append((start, i))
+    if in_seg:
+        segments.append((start, len(arr_bool)))
+    if len(segments) <= 1:
+        return None
+    arr_start = np.array([s for s, e in segments], dtype=int)
+    arr_end = np.array([e for s, e in segments], dtype=int)
+    return arr_start, arr_end
+
+# -----------------------------
+# 基于分块判断右下角空白并排序
+# -----------------------------
+def sort_blocks_by_visual(children_blocks):
+    """
+    输入已经 X 切分好的子块列表，判断右下角空白并按列→行排序
+    """
+    if not children_blocks:
+        return []
+
+    # 计算每块左上角(x0,y0)和右下角(x1,y1)
+    for blk in children_blocks:
+        b = blk['boxes']
+        blk['x0'], blk['y0'] = np.min(b[:,0]), np.min(b[:,1])
+        blk['x1'], blk['y1'] = np.max(b[:,2]), np.max(b[:,3])
+
+    # 判断右下角空白：对每个块，右下角右侧和下方没有其他块覆盖
+    for blk in children_blocks:
+        blk['has_blank'] = True
+        for other in children_blocks:
+            if other is blk:
+                continue
+            # 如果 other 在右下角覆盖该块右下
+            if other['x0'] < blk['x1'] and other['y0'] < blk['y1']:
+                blk['has_blank'] = False
+                break
+
+    # 如果有空白块，则按列→行排序
+    if any(blk['has_blank'] for blk in children_blocks):
+        sorted_blocks = []
+        remaining = children_blocks[:]
+        while remaining:
+            base = remaining[0]
+            col_group = [base]
+            rest = []
+            for blk in remaining[1:]:
+                # 同一列判断，可用小于等于 col_threshold 认为同列
+                if abs(blk['x0'] - base['x0']) <= 1:  # 精确到块分好的坐标
+                    col_group.append(blk)
+                else:
+                    rest.append(blk)
+            # 列内按 y0 上到下排序
+            col_group.sort(key=lambda blk: blk['y0'])
+            sorted_blocks.extend(col_group)
+            remaining = rest
+        children_blocks = sorted_blocks
+
+        # 所有排序后的块加视觉排序标记
+        for blk in children_blocks:
+            blk['cut_path_add'] = "V"
+    else:
+        for blk in children_blocks:
+            blk['cut_path_add'] = None
+
+    return children_blocks
+
+# -----------------------------
+# 全局 XY-cut 递归（cut_path 优化版）
+# -----------------------------
+def recursive_xy_cut_grouped_global(
+        boxes: np.ndarray,
+        indices: List[int],
+        res_groups: List[dict],
+        cut_history: Optional[List[str]] = None,
+        row_id: Optional[int] = None,
+        counters: Optional[dict] = None,
+):
+    if cut_history is None:
+        cut_history = []
+    if counters is None:
+        counters = {"row": 0}
+
+    if boxes.shape[0] == 0:
+        return
+
+    # 1) 尝试 Y 切分
+    y_proj = projection_by_bboxes(boxes, axis=1)
+    pos_y = split_projection_profile_zero(y_proj)
+
+    if pos_y is not None:
+        arr_y0, arr_y1 = pos_y
+        outer_blocks = []
+        for r0, r1 in zip(arr_y0, arr_y1):
+            mask = (boxes[:,1] >= r0) & (boxes[:,1] < r1)
+            outer_blocks.append({
+                'boxes': boxes[mask],
+                'indices': np.array(indices)[mask].tolist(),
+                'row_id': counters["row"]
+            })
+            counters["row"] += 1
+
+        # 2) 对每个 Y 块再按 X 切分
+        children_blocks = []
+        for blk in outer_blocks:
+            x_proj = projection_by_bboxes(blk['boxes'], axis=0)
+            pos_x = split_projection_profile_zero(x_proj)
+            if pos_x is not None:
+                arr_x0, arr_x1 = pos_x
+                for c0, c1 in zip(arr_x0, arr_x1):
+                    mask = (blk['boxes'][:,0] >= c0) & (blk['boxes'][:,0] < c1)
+                    children_blocks.append({
+                        'boxes': blk['boxes'][mask],
+                        'indices': np.array(blk['indices'])[mask].tolist(),
+                        'row_id': blk['row_id']
+                    })
+            else:
+                children_blocks.append(blk)
+
+        # 3) 判断右下角空白并按列→行排序
+        children_blocks = sort_blocks_by_visual(children_blocks)
+
+        # 4) 递归每个子块，更新 cut_path
+        for blk in children_blocks:
+            new_cut_history = cut_history + ["Y", "X"]
+            if blk.get('cut_path_add') == "V":
+                new_cut_history.append("V")
+            recursive_xy_cut_grouped_global(
+                blk['boxes'],
+                blk['indices'],
+                res_groups,
+                cut_history=new_cut_history,
+                row_id=blk['row_id'],
+                counters=counters
+            )
+        return
+
+    # 2) Y 无法切，尝试 X 切
+    x_proj = projection_by_bboxes(boxes, axis=0)
+    pos_x = split_projection_profile_zero(x_proj)
+    if pos_x is not None:
+        arr_x0, arr_x1 = pos_x
+        for c0, c1 in zip(arr_x0, arr_x1):
+            mask = (boxes[:,0] >= c0) & (boxes[:,0] < c1)
+            recursive_xy_cut_grouped_global(
+                boxes[mask],
+                np.array(indices)[mask].tolist(),
+                res_groups,
+                cut_history=cut_history + ["X"],
+                row_id=row_id,
+                counters=counters
+            )
+        return
+
+    # 3) 无法切分，作为叶子组
+    res_groups.append({
+        'indices': list(indices),
+        'cut_path': cut_history.copy(),
+        'row_id': row_id
+    })
