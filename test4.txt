@@ -1,0 +1,45 @@
+def recursive_xy_cut_grouped(boxes: np.ndarray, indices: List[int], res_groups: List[List[int]]):
+    if len(boxes) == 0:
+        return
+
+    stack = [(boxes, indices)]
+
+    while stack:
+        current_boxes, current_indices = stack.pop()
+
+        # y 方向投影
+        y_projection = projection_by_bboxes(current_boxes, axis=1)
+        pos_y = split_projection_profile_zero(y_projection, min_gap=1)
+
+        if pos_y:
+            arr_y0, arr_y1 = pos_y
+            for r0, r1 in zip(arr_y0, arr_y1):
+                y_mask = (current_boxes[:, 1] >= r0) & (current_boxes[:, 1] < r1)
+                boxes_chunk = current_boxes[y_mask]
+                indices_chunk = np.array(current_indices)[y_mask]
+
+                # x 方向投影
+                x_projection = projection_by_bboxes(boxes_chunk, axis=0)
+                pos_x = split_projection_profile_zero(x_projection, min_gap=1)
+
+                if pos_x and len(pos_x[0]) > 1:
+                    # x 方向可切，继续递归
+                    arr_x0, arr_x1 = pos_x
+                    for c0, c1 in zip(arr_x0, arr_x1):
+                        x_mask = (boxes_chunk[:, 0] >= c0) & (boxes_chunk[:, 0] < c1)
+                        stack.append((boxes_chunk[x_mask], indices_chunk[x_mask]))
+                else:
+                    # x 方向无法切，也作为一组
+                    res_groups.append(indices_chunk.tolist())
+        else:
+            # y 方向无法切，尝试 x 方向切割整个区域
+            x_projection = projection_by_bboxes(current_boxes, axis=0)
+            pos_x = split_projection_profile_zero(x_projection, min_gap=1)
+            if pos_x and len(pos_x[0]) > 1:
+                arr_x0, arr_x1 = pos_x
+                for c0, c1 in zip(arr_x0, arr_x1):
+                    x_mask = (current_boxes[:, 0] >= c0) & (current_boxes[:, 0] < c1)
+                    stack.append((current_boxes[x_mask], np.array(current_indices)[x_mask]))
+            else:
+                # x 方向也无法切，最终作为一个组
+                res_groups.append(current_indices)
