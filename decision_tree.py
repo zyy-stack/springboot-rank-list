@@ -50,3 +50,45 @@ if __name__=="__main__":
     entropy_list.sort(reverse=True)
     print(entropy_list[0])
 
+import numpy as np
+
+
+class PageRank:
+    def __init__(self, N, M, I, K, alpha=0.85):
+        self.N = N
+        self.M = M
+        self.I = I
+        self.K = K
+        self.alpha=alpha
+        pass
+
+    def predict(self, data):
+        T = data
+        M = np.zeros(T.shape)
+        L = np.sum(T, axis=1)
+        for i in range(T.shape[0]):
+            for j in range(T.shape[1]):
+                if L[i]!=0:
+                    M[j, i] = T[i, j] / L[i]
+        V=L
+        for _ in range(self.I):
+           V =(1-self.alpha) / self.N + self.alpha*np.dot(M,V.T)
+        s=V.argsort()[::-1]
+        return "\n".join(["%d %.2f" % (i,V[i]) for i in s[:self.K]])
+
+def load_data():
+    N, M, I, K = map(int, input().split())
+    data = np.zeros((N,N))
+    for i in range(M):
+        c1,c2,num=map(int, input().split())
+        data[c1,c2]+=num
+    print(data)
+    return N, M, I, K, data
+
+
+if __name__ == '__main__':
+    N, M, I, K, data = load_data()
+    pr = PageRank(N, M, I, K)
+    print(pr.predict(data))
+
+
