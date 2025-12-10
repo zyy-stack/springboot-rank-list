@@ -43,3 +43,116 @@ def recursive_xy_cut_grouped(boxes: np.ndarray, indices: List[int], res_groups: 
             else:
                 # x 方向也无法切，最终作为一个组
                 res_groups.append(current_indices)
+def split_projection_profile_zero(arr_values: np.ndarray, min_gap: int = 1):
+    """
+    按投影直方图低谷（值为 0）切割，并加入“只切显著 gap”逻辑
+    """
+    arr_index = np.where(arr_values > 0)[0]
+    if not len(arr_index):
+        return None
+
+    arr_diff = arr_index[1:] - arr_index[:-1]
+    raw_gap_idx = np.where(arr_diff > min_gap)[0]
+
+    if len(raw_gap_idx) == 0:
+        return None
+
+    # 原始 gaps
+    gaps = arr_diff[raw_gap_idx]
+
+    # ---- 新增：gap 显著性判断（最小侵入） ----
+    if len(gaps) > 1:
+        median_gap = np.median(gaps)
+        max_gap = np.max(gaps)
+
+        # 如果所有 gap 都差不多 → 认为是表格/列，不切
+        if max_gap < median_gap * 1.8:
+            return None
+
+        # max 必须比 second max 大明显
+        sorted_g = np.sort(gaps)
+        if len(sorted_g) > 1 and sorted_g[-1] < sorted_g[-2] * 1.5:
+            return None
+    # ---- 新增结束 ----
+
+    # 和你原始代码一致
+    arr_zero_start = arr_index[raw_gap_idx]
+    arr_zero_end = arr_index[raw_gap_idx + 1]
+
+    arr_start = np.insert(arr_zero_end, 0, arr_index[0])
+    arr_end = np.append(arr_zero_start, arr_index[-1])
+    arr_end += 1
+    return arr_start, arr_end
+def recursive_xy_cut_grouped(boxes: np.ndarray, indices: List[int], res_groups: List[List[int]], _is_root=True):
+    if len(boxes) == 0:
+        return
+
+    # ---- 新增：只有第一层自适应方向 ----
+    if _is_root:
+        y_proj = projection_by_bboxes(boxes, axis=1)
+        x_proj = projection_by_bboxes(boxes, axis=0)
+        y_pos = split_projection_profile_zero(y_proj, min_gap=1)
+        x_pos = split_projection_profile_zero(x_proj, min_gap=1)
+
+        # 决定第一层方向
+        if y_pos and not x_pos:
+            first_axis = 1
+        elif x_pos and not y_pos:
+            first_axis = 0
+        elif y_pos and x_pos:
+            # 谁 gap 更大切谁（仍尽量保持简洁）
+            if np.max(y_proj) >= np.max(x_proj):
+                first_axis = 1
+            else:
+                first_axis = 0
+        else:
+            # 都无法切
+            first_axis = None
+
+        if first_axis == 0:
+            # 仅第一层：改为先 X 再 Y
+            x_projection = x_proj
+            pos_x = x_pos
+            if pos_x:
+                arr_x0, arr_x1 = pos_x
+                for c0, c1 in zip(arr_x0, arr_x1):
+                    x_mask = (boxes[:, 0] >= c0) & (boxes[:, 0] < c1)
+                    recursive_xy_cut_grouped(boxes[x_mask], np.array(indices)[x_mask], res_groups, _is_root=False)
+                return
+        # 如果 first_axis == 1 或 None → 正常流程即可继续
+    # ---- 新增结束 ----
+
+    # ===== 下面是你原代码（1字未删） =====
+
+    # y 方向投影
+    y_projection = projection_by_bboxes(boxes, axis=1)
+    pos_y = split_projection_profile_zero(y_projection, min_gap=1)
+
+    if pos_y:
+        arr_y0, arr_y1 = pos_y
+        for r0, r1 in zip(arr_y0, arr_y1):
+            y_mask = (boxes[:, 1] >= r0) & (boxes[:, 1] < r1)
+            boxes_chunk = boxes[y_mask]
+            indices_chunk = np.array(indices)[y_mask]
+
+            # x 方向投影
+            x_projection = projection_by_bboxes(boxes_chunk, axis=0)
+            pos_x = split_projection_profile_zero(x_projection, min_gap=1)
+
+            if pos_x and len(pos_x[0]) > 1:
+                arr_x0, arr_x1 = pos_x
+                for c0, c1 in zip(arr_x0, arr_x1):
+                    x_mask = (boxes_chunk[:, 0] >= c0) & (boxes_chunk[:, 0] < c1)
+                    recursive_xy_cut_grouped(boxes_chunk[x_mask], indices_chunk[x_mask], res_groups, _is_root=False)
+            else:
+                res_groups.append(indices_chunk.tolist())
+    else:
+        x_projection = projection_by_bboxes(boxes, axis=0)
+        pos_x = split_projection_profile_zero(x_projection, min_gap=1)
+        if pos_x and len(pos_x[0]) > 1:
+            arr_x0, arr_x1 = pos_x
+            for c0, c1 in zip(arr_x0, arr_x1):
+                x_mask = (boxes[:, 0] >= c0) & (boxes[:, 0] < c1)
+                recursive_xy_cut_grouped(boxes[x_mask], np.array(indices)[x_mask], res_groups, _is_root=False)
+        else:
+            res_groups.append(indices)
