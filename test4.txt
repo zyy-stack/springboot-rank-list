@@ -1,158 +1,189 @@
-def recursive_xy_cut_grouped(boxes: np.ndarray, indices: List[int], res_groups: List[List[int]]):
-    if len(boxes) == 0:
-        return
+from typing import List
+import cv2
+import numpy as np
 
-    stack = [(boxes, indices)]
 
-    while stack:
-        current_boxes, current_indices = stack.pop()
-
-        # y 方向投影
-        y_projection = projection_by_bboxes(current_boxes, axis=1)
-        pos_y = split_projection_profile_zero(y_projection, min_gap=1)
-
-        if pos_y:
-            arr_y0, arr_y1 = pos_y
-            for r0, r1 in zip(arr_y0, arr_y1):
-                y_mask = (current_boxes[:, 1] >= r0) & (current_boxes[:, 1] < r1)
-                boxes_chunk = current_boxes[y_mask]
-                indices_chunk = np.array(current_indices)[y_mask]
-
-                # x 方向投影
-                x_projection = projection_by_bboxes(boxes_chunk, axis=0)
-                pos_x = split_projection_profile_zero(x_projection, min_gap=1)
-
-                if pos_x and len(pos_x[0]) > 1:
-                    # x 方向可切，继续递归
-                    arr_x0, arr_x1 = pos_x
-                    for c0, c1 in zip(arr_x0, arr_x1):
-                        x_mask = (boxes_chunk[:, 0] >= c0) & (boxes_chunk[:, 0] < c1)
-                        stack.append((boxes_chunk[x_mask], indices_chunk[x_mask]))
-                else:
-                    # x 方向无法切，也作为一组
-                    res_groups.append(indices_chunk.tolist())
-        else:
-            # y 方向无法切，尝试 x 方向切割整个区域
-            x_projection = projection_by_bboxes(current_boxes, axis=0)
-            pos_x = split_projection_profile_zero(x_projection, min_gap=1)
-            if pos_x and len(pos_x[0]) > 1:
-                arr_x0, arr_x1 = pos_x
-                for c0, c1 in zip(arr_x0, arr_x1):
-                    x_mask = (current_boxes[:, 0] >= c0) & (current_boxes[:, 0] < c1)
-                    stack.append((current_boxes[x_mask], np.array(current_indices)[x_mask]))
-            else:
-                # x 方向也无法切，最终作为一个组
-                res_groups.append(current_indices)
-def split_projection_profile_zero(arr_values: np.ndarray, min_gap: int = 1):
+def projection_by_bboxes(boxes: np.array, axis: int) -> np.ndarray:
     """
-    按投影直方图低谷（值为 0）切割，并加入“只切显著 gap”逻辑
+     通过一组 bbox 获得投影直方图，最后以 per-pixel 形式输出
+
+    Args:
+        boxes: [N, 4]
+        axis: 0-x坐标向水平方向投影， 1-y坐标向垂直方向投影
+
+    Returns:
+        1D 投影直方图，长度为投影方向坐标的最大值(我们不需要图片的实际边长，因为只是要找文本框的间隔)
+
+    """
+    assert axis in [0, 1]
+    length = np.max(boxes[:, axis::2])
+    res = np.zeros(length, dtype=int)
+    # TODO: how to remove for loop?
+    for start, end in boxes[:, axis::2]:
+        res[start:end] += 1
+    return res
+
+def split_once_by_max_gap(arr_values: np.ndarray,
+                          min_gap: int = 1,
+                          gap_ratio: float = 1.5):
+    """
+    只在最显著的 0 低谷处分一次（最多 2 块）
     """
     arr_index = np.where(arr_values > 0)[0]
     if not len(arr_index):
         return None
 
     arr_diff = arr_index[1:] - arr_index[:-1]
-    raw_gap_idx = np.where(arr_diff > min_gap)[0]
-
-    if len(raw_gap_idx) == 0:
+    diff_idx = np.where(arr_diff > min_gap)[0]
+    if len(diff_idx) == 0:
         return None
 
-    # 原始 gaps
-    gaps = arr_diff[raw_gap_idx]
+    gaps = arr_diff[diff_idx]
 
-    # ---- 新增：gap 显著性判断（最小侵入） ----
     if len(gaps) > 1:
         median_gap = np.median(gaps)
         max_gap = np.max(gaps)
-
-        # 如果所有 gap 都差不多 → 认为是表格/列，不切
-        if max_gap < median_gap * 1.8:
+        if max_gap < median_gap * gap_ratio:
             return None
+        cut_pos = diff_idx[np.argmax(gaps)]
+    else:
+        cut_pos = diff_idx[0]
 
-        # max 必须比 second max 大明显
-        sorted_g = np.sort(gaps)
-        if len(sorted_g) > 1 and sorted_g[-1] < sorted_g[-2] * 1.5:
-            return None
-    # ---- 新增结束 ----
+    # 显式分成两个连续区间（axis-agnostic）
+    first_start = arr_index[0]
+    first_end = arr_index[cut_pos] + 1
 
-    # 和你原始代码一致
-    arr_zero_start = arr_index[raw_gap_idx]
-    arr_zero_end = arr_index[raw_gap_idx + 1]
+    second_start = arr_index[cut_pos + 1]
+    second_end = arr_index[-1] + 1
 
-    arr_start = np.insert(arr_zero_end, 0, arr_index[0])
-    arr_end = np.append(arr_zero_start, arr_index[-1])
-    arr_end += 1
-    return arr_start, arr_end
-def recursive_xy_cut_grouped(boxes: np.ndarray, indices: List[int], res_groups: List[List[int]], _is_root=True):
-    if len(boxes) == 0:
+    return (
+        np.array([first_start, second_start]),
+        np.array([first_end, second_end])
+    )
+
+def gap_from_pos(pos):
+    if pos is None:
+        return 0
+    starts, ends = pos
+    if len(starts) != 2:
+        return 0
+    return starts[1] - ends[0]
+def overlap_1d(a0, a1, b0, b1):
+    inter = max(0, min(a1, b1) - max(a0, b0))
+    union = min((a1-a0),(b1-b0))
+    return inter / union if union > 0 else 0
+
+def group_rows_by_y_overlap(boxes, min_overlap=0.5):
+    rows = []
+    count=0
+    for i in range(len(boxes)):
+        placed = False
+        for row in rows:
+            j = row[0]
+            if overlap_1d(boxes[i,1], boxes[i,3],
+                          boxes[j,1], boxes[j,3]) >= min_overlap:
+                row.append(i)
+                count+=1
+                placed = True
+                break
+        if not placed:
+            rows.append([i])
+            count+=1
+    print(count)
+    return rows
+
+def first_column_aligned(boxes, rows, min_overlap=0.5):
+    first_boxes = []
+
+    for row in rows:
+        row_sorted = sort_row_by_x(boxes, row)
+        first_boxes.append(row_sorted[0])
+
+    ref = first_boxes[0]
+    for i in first_boxes[1:]:
+        if overlap_1d(boxes[ref,0], boxes[ref,2],
+                      boxes[i,0], boxes[i,2]) < min_overlap:
+            return False
+
+    return True
+
+def sort_row_by_x(boxes, row):
+    return sorted(row, key=lambda i: boxes[i, 0])
+
+
+def row_length_consistent(rows, ratio=0.3):
+    lengths = np.array([len(r) for r in rows])
+    med = np.median(lengths)
+
+    return np.all(np.abs(lengths - med) / med <= ratio)
+
+def is_weak_grid_layout(boxes,
+                        min_y_overlap=0.5,
+                        min_x_overlap=0.5,
+                        max_row_len_diff=1,
+                        min_rows=2):
+    if len(boxes) < 4:
+        return False
+
+    rows = group_rows_by_y_overlap(boxes, min_y_overlap)
+    if len(rows) < min_rows:
+        return False
+
+    rows = [sort_row_by_x(boxes, r) for r in rows]
+
+    if not row_length_consistent(rows, max_row_len_diff):
+        return False
+
+    if not first_column_aligned(boxes, rows, min_x_overlap):
+        return False
+
+    return True
+
+
+def recursive_xy_cut_grouped(boxes: np.ndarray,
+                             indices: List[int],
+                             res_groups: List[List[int]]):
+
+    if is_weak_grid_layout(boxes):
+        res_groups.append(indices)
+        return
+    # 同时评估两个方向
+    y_proj = projection_by_bboxes(boxes, axis=1)
+    x_proj = projection_by_bboxes(boxes, axis=0)
+
+    y_pos = split_once_by_max_gap(y_proj)
+    x_pos = split_once_by_max_gap(x_proj)
+
+    # ---------- 每一层都做方向选择 ----------
+    if y_pos and not x_pos:
+        axis = 1
+    elif x_pos and not y_pos:
+        axis = 0
+    elif y_pos and x_pos:
+        # 用“最大 0 低谷宽度”衡量结构断裂
+        y_gap = gap_from_pos(y_pos)
+        x_gap = gap_from_pos(x_pos)
+        axis = 1 if y_gap >= x_gap else 0
+    else:
+        axis = None
+
+    # ---------- 不可再切，收敛 ----------
+    if axis is None:
+        res_groups.append(indices)
         return
 
-    # ---- 新增：只有第一层自适应方向 ----
-    if _is_root:
-        y_proj = projection_by_bboxes(boxes, axis=1)
-        x_proj = projection_by_bboxes(boxes, axis=0)
-        y_pos = split_projection_profile_zero(y_proj, min_gap=1)
-        x_pos = split_projection_profile_zero(x_proj, min_gap=1)
+    # ---------- 沿选定方向切一刀 ----------
+    proj = y_proj if axis == 1 else x_proj
+    starts, ends = split_once_by_max_gap(proj)
 
-        # 决定第一层方向
-        if y_pos and not x_pos:
-            first_axis = 1
-        elif x_pos and not y_pos:
-            first_axis = 0
-        elif y_pos and x_pos:
-            # 谁 gap 更大切谁（仍尽量保持简洁）
-            if np.max(y_proj) >= np.max(x_proj):
-                first_axis = 1
-            else:
-                first_axis = 0
+    for s, e in zip(starts, ends):
+        if axis == 1:
+            mask = (boxes[:, 1] >= s) & (boxes[:, 3] <= e)
         else:
-            # 都无法切
-            first_axis = None
+            mask = (boxes[:, 0] >= s) & (boxes[:, 2] <= e)
 
-        if first_axis == 0:
-            # 仅第一层：改为先 X 再 Y
-            x_projection = x_proj
-            pos_x = x_pos
-            if pos_x:
-                arr_x0, arr_x1 = pos_x
-                for c0, c1 in zip(arr_x0, arr_x1):
-                    x_mask = (boxes[:, 0] >= c0) & (boxes[:, 0] < c1)
-                    recursive_xy_cut_grouped(boxes[x_mask], np.array(indices)[x_mask], res_groups, _is_root=False)
-                return
-        # 如果 first_axis == 1 或 None → 正常流程即可继续
-    # ---- 新增结束 ----
-
-    # ===== 下面是你原代码（1字未删） =====
-
-    # y 方向投影
-    y_projection = projection_by_bboxes(boxes, axis=1)
-    pos_y = split_projection_profile_zero(y_projection, min_gap=1)
-
-    if pos_y:
-        arr_y0, arr_y1 = pos_y
-        for r0, r1 in zip(arr_y0, arr_y1):
-            y_mask = (boxes[:, 1] >= r0) & (boxes[:, 1] < r1)
-            boxes_chunk = boxes[y_mask]
-            indices_chunk = np.array(indices)[y_mask]
-
-            # x 方向投影
-            x_projection = projection_by_bboxes(boxes_chunk, axis=0)
-            pos_x = split_projection_profile_zero(x_projection, min_gap=1)
-
-            if pos_x and len(pos_x[0]) > 1:
-                arr_x0, arr_x1 = pos_x
-                for c0, c1 in zip(arr_x0, arr_x1):
-                    x_mask = (boxes_chunk[:, 0] >= c0) & (boxes_chunk[:, 0] < c1)
-                    recursive_xy_cut_grouped(boxes_chunk[x_mask], indices_chunk[x_mask], res_groups, _is_root=False)
-            else:
-                res_groups.append(indices_chunk.tolist())
-    else:
-        x_projection = projection_by_bboxes(boxes, axis=0)
-        pos_x = split_projection_profile_zero(x_projection, min_gap=1)
-        if pos_x and len(pos_x[0]) > 1:
-            arr_x0, arr_x1 = pos_x
-            for c0, c1 in zip(arr_x0, arr_x1):
-                x_mask = (boxes[:, 0] >= c0) & (boxes[:, 0] < c1)
-                recursive_xy_cut_grouped(boxes[x_mask], np.array(indices)[x_mask], res_groups, _is_root=False)
-        else:
-            res_groups.append(indices)
+        recursive_xy_cut_grouped(
+            boxes[mask],
+            [indices[i] for i, m in enumerate(mask) if m],
+            res_groups
+        )
