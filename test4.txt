@@ -187,3 +187,141 @@ def recursive_xy_cut_grouped(boxes: np.ndarray,
             [indices[i] for i, m in enumerate(mask) if m],
             res_groups
         )
+def robust_average_median_mad(data: List[float],threshold: float = 3.0,scale_factor: float = 1.4826,) -> float:
+    """
+    使用Median + MAD方法去除异常值后计算平均值
+    :param data: 原始数据列表
+    :param threshold: MAD倍数阈值，默认3.0（常用范围2.5-3.5）
+    :param scale_factor: MAD缩放因子，默认1.4826（正态分布常数）
+    :returns: 去异常后的平均值
+    """
+    if not data:
+        return 0.0
+
+    data_array = np.array(data)
+
+    # 1. 计算中位数
+    median = np.median(data_array)
+
+    # 2. 计算MAD
+    abs_deviation = np.abs(data_array - median)
+    mad = np.median(abs_deviation)
+
+    # 3. 如果没有变异（所有值相同），直接返回中位数
+    if mad == 0:
+        result = float(median)
+        return result
+
+    # 4. 使用提供的缩放因子调整MAD
+    scaled_mad = mad * scale_factor
+
+    # 5. 基于阈值过滤异常值
+    mask = np.abs(data_array - median) / scaled_mad <= threshold
+    filtered_data = data_array[mask]
+
+    # 6. 计算过滤后的平均值（如果过滤后无数据，则使用中位数）
+    if len(filtered_data) > 0:
+        result = float(np.mean(filtered_data))
+    else:
+        result = float(median)
+
+    return result
+
+def split_once_by_max_gap(arr_values: np.ndarray,
+                          min_gap: int = 1,
+                          gap_ratio: float = 1.5):
+    """
+    只在最显著的 0 低谷处分一次（最多 2 块）
+    """
+    arr_index = np.where(arr_values > 0)[0]
+    if not len(arr_index):
+        return None
+
+    arr_diff = arr_index[1:] - arr_index[:-1]
+    diff_idx = np.where(arr_diff > min_gap)[0]
+    if len(diff_idx) == 0:
+        return None
+
+    gaps = arr_diff[diff_idx]
+
+    if len(gaps) > 1:
+        # 对间隙排序
+        sorted_gaps = np.sort(gaps)
+        max_gap = sorted_gaps[-1]
+        second_max_gap = sorted_gaps[-2]
+
+        # 只有当最大间隙显著大于第二大间隙时才切割
+        if max_gap < second_max_gap * gap_ratio:
+            return None
+
+        # 找到最大间隙在原始数组中的位置
+        max_gap_idx_in_gaps = np.argmax(gaps)
+        cut_pos = diff_idx[max_gap_idx_in_gaps]
+    else:
+        cut_pos = diff_idx[0]
+
+    # 显式分成两个连续区间（axis-agnostic）
+    first_start = arr_index[0]
+    first_end = arr_index[cut_pos] + 1
+
+    second_start = arr_index[cut_pos + 1]
+    second_end = arr_index[-1] + 1
+
+    return (
+        np.array([first_start, second_start]),
+        np.array([first_end, second_end])
+    )
+
+
+def split_blocks_once(boxes: np.ndarray,indices: List[int],axis: int,pos):
+    """
+    根据 split_once_by_max_gap 的结果切一次
+    pos 为 None 表示不可切
+    """
+    if pos is None:
+        return [(boxes, indices)]
+
+    starts, ends = pos
+    blocks = []
+
+    for s, e in zip(starts, ends):
+        if axis == 0:
+            mask = (boxes[:, 0] >= s) & (boxes[:, 2] <= e)
+        else:
+            mask = (boxes[:, 1] >= s) & (boxes[:, 3] <= e)
+
+        if np.any(mask):
+            blocks.append((
+                boxes[mask],
+                [indices[i] for i, m in enumerate(mask) if m]
+            ))
+
+    return blocks
+
+def xy_cut_eval_then_x_y_once(boxes: np.ndarray,indices: List[int],res_groups: List[List[int]]):
+    # 同时评估两个方向
+    y_proj = projection_by_bboxes(boxes, axis=1)
+    x_proj = projection_by_bboxes(boxes, axis=0)
+    y_pos = split_once_by_max_gap(y_proj)
+    x_pos = split_once_by_max_gap(x_proj)
+
+    #  X 切一次（或不切）
+    x_blocks = split_blocks_once(boxes, indices, axis=0, pos=x_pos)
+
+    # 对每个 X 块做一次 Y
+    for xb, idxb in x_blocks:
+        if y_pos is None:
+            res_groups.append(idxb)
+            continue
+
+        y_proj_sub =projection_by_bboxes(xb, axis=1)
+        y_pos_sub = split_once_by_max_gap(y_proj_sub)
+
+        if y_pos_sub is None:
+            res_groups.append(idxb)
+            continue
+
+        y_blocks = split_blocks_once(xb, idxb, axis=1, pos=y_pos_sub)
+
+        for _, ids in y_blocks:
+            res_groups.append(ids)
